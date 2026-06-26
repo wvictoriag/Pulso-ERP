@@ -1,0 +1,6 @@
+{
+  "name": "Pulso ERP Dashboard",
+  "description": "Un panel de control personalizado para visualizar y automatizar datos de tu Mini ERP impulsado por PostgreSQL y Drizzle ORM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
