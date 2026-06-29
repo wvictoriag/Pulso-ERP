@@ -3,7 +3,7 @@ import { GoogleGenAI } from '@google/genai';
 import { db } from '../db';
 import { requireAuth, requireRole } from '../middleware/auth';
 import { clientes, finanzas, pedidos, productos, proveedores, users, kardex } from '../db/schema';
-import { eq, desc } from 'drizzle-orm';
+import { eq, desc, sql, sum, count, gte, and, like } from 'drizzle-orm';
 import { ZodError } from 'zod';
 import {
   clienteSchema,
@@ -16,19 +16,20 @@ import {
 
 export const apiRouter = express.Router();
 
+const LOW_STOCK_THRESHOLD = parseInt(process.env.LOW_STOCK_THRESHOLD || '10', 10);
+
 // Helper para actualizar stock y kardex usando transacción
+// Lanza error si el stock queda negativo
 async function adjustStock(tx: any, productoId: number, cantidad: number, tipoMovimiento: 'Entrada' | 'Salida', motivo: string, usuario: string, pedidoId?: number) {
   const product = await tx.select().from(productos).where(eq(productos.id, productoId)).limit(1);
   if (!product[0]) return;
-  
-  const mult = tipoMovimiento === 'Entrada' ? 1 : -1;
 
   if (product[0].esKit && product[0].componentesKit) {
     // Es un kit, ajustamos los componentes
-    const componentes: any[] = typeof product[0].componentesKit === 'string' 
-      ? JSON.parse(product[0].componentesKit) 
+    const componentes: any[] = typeof product[0].componentesKit === 'string'
+      ? JSON.parse(product[0].componentesKit)
       : product[0].componentesKit;
-      
+
     for (const comp of componentes) {
       const pId = comp.productoId;
       const cQty = comp.cantidad * cantidad;
@@ -37,16 +38,24 @@ async function adjustStock(tx: any, productoId: number, cantidad: number, tipoMo
       }
     }
   } else {
-    // Producto normal
+    // Producto normal — validar stock suficiente para salidas
+    if (tipoMovimiento === 'Salida') {
+      const newStock = product[0].stock - cantidad;
+      if (newStock < 0) {
+        throw new Error(`Stock insuficiente para "${product[0].nombre}". Stock actual: ${product[0].stock}, solicitado: ${cantidad}`);
+      }
+    }
+
+    const mult = tipoMovimiento === 'Entrada' ? 1 : -1;
     await tx.update(productos).set({ stock: product[0].stock + (cantidad * mult) }).where(eq(productos.id, productoId));
-    
+
     // Registrar en kardex
     await tx.insert(kardex).values({
       productoId,
       tipoMovimiento,
       motivo,
       cantidad,
-      fecha: new Date().toISOString(),
+      fecha: new Date(),
       usuario: usuario || 'Sistema',
       pedidoId
     });
@@ -140,6 +149,7 @@ const toPascalCase = (str: string) => {
     componentesKit: 'Componentes del Kit',
     subtotal: 'Subtotal',
     iva: 'IVA',
+    stockMinimo: 'Stock Mínimo',
   };
   return map[str] || (str.charAt(0).toUpperCase() + str.slice(1));
 };
@@ -188,6 +198,7 @@ const fromClientFormat = (fields: any) => {
     'Componentes del Kit': 'componentesKit',
     'Subtotal': 'subtotal',
     'IVA': 'iva',
+    'Stock Mínimo': 'stockMinimo',
   };
   for (const key of Object.keys(fields)) {
     let dKey = reverseMap[key] || (key.charAt(0).toLowerCase() + key.slice(1));
@@ -196,30 +207,53 @@ const fromClientFormat = (fields: any) => {
       const parsed = parseInt(val, 10);
       if (!isNaN(parsed)) val = parsed;
     }
-    
+
     // Parse boolean for esKit
     if (dKey === 'esKit') {
       val = val === 'true' || val === true || val === 'Sí' || val === 'Si';
     }
-    
+
     record[dKey] = val;
   }
   return record;
 };
 
+// GET /api/table/:tableName?page=1&limit=50&search=term
 apiRouter.get('/table/:tableName', requireAuth, async (req, res) => {
   const target = getTableTarget(req.params.tableName);
   if (!target) return res.status(404).json({ error: 'Not found' });
+
   try {
-    const data = await db.select().from(target).orderBy(desc(target.id));
-    res.json({ data: data.map(toClientFormat) });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'DB Error' }); }
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const offset = (page - 1) * limit;
+
+    // Obtener datos paginados
+    const data = await db.select().from(target).orderBy(desc(target.id)).limit(limit).offset(offset);
+
+    // Contar total para metadata de paginación
+    const totalResult = await db.select({ count: count() }).from(target);
+    const total = totalResult[0]?.count || 0;
+
+    res.json({
+      data: data.map(toClientFormat),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'DB Error' });
+  }
 });
 
 apiRouter.post('/table/:tableName', requireAuth, async (req, res) => {
   const target = getTableTarget(req.params.tableName);
   if (!target) return res.status(404).json({ error: 'Not found' });
-  
+
   try {
     const { records } = req.body;
     if (!Array.isArray(records)) {
@@ -252,7 +286,7 @@ apiRouter.post('/table/:tableName', requireAuth, async (req, res) => {
       const results = [];
       for (const row of parsedRows) {
         const newRecord = await tx.insert(target).values(row).returning();
-        
+
         if (req.params.tableName === 'Pedidos' || req.params.tableName === 'Ventas') {
            if (row.estado === '✅ Entregado' || row.estado === '✅ Confirmado') {
              const items = row.items || [];
@@ -261,7 +295,11 @@ apiRouter.post('/table/:tableName', requireAuth, async (req, res) => {
                const pId = item.productoId || item.Producto?.[0] || item.Producto;
                const qty = item.cantidad || item.Cantidad;
                if (pId && qty) {
-                 await adjustStock(tx, parseInt(pId), qty, 'Salida', 'Venta', (req as any).user?.email, newRecord[0].id);
+                 try {
+                   await adjustStock(tx, parseInt(pId), qty, 'Salida', 'Venta', (req as any).user?.email, newRecord[0].id);
+                 } catch (stockErr: any) {
+                   throw new Error(`Error en pedido: ${stockErr.message}`);
+                 }
                }
              }
            }
@@ -274,7 +312,8 @@ apiRouter.post('/table/:tableName', requireAuth, async (req, res) => {
     res.json({ data: created });
   } catch (e: any) {
     console.error(e);
-    res.status(500).json({ error: 'DB Error', message: e.message });
+    const status = e.message.includes('Stock insuficiente') ? 400 : 500;
+    res.status(status).json({ error: e.message.includes('Stock insuficiente') ? e.message : 'DB Error', message: e.message });
   }
 });
 
@@ -360,10 +399,10 @@ apiRouter.delete('/table/:tableName/:id', requireAuth, requireRole(['admin']), a
 apiRouter.put('/table/:tableName/:id', requireAuth, async (req, res) => {
   const target = getTableTarget(req.params.tableName);
   if (!target) return res.status(404).json({ error: 'Not found' });
-  
+
   try {
     const row = fromClientFormat(req.body.fields);
-    
+
     // Validación Zod
     const schema = getValidationSchema(req.params.tableName);
     if (schema) {
@@ -389,7 +428,7 @@ apiRouter.put('/table/:tableName/:id', requireAuth, async (req, res) => {
       let isNewlyEntregado = false;
       let isNewlyCancelled = false;
       let oldItems: any[] = [];
-      
+
       if (req.params.tableName === 'Pedidos' || req.params.tableName === 'Ventas') {
         const oldRecord = await tx.select().from(target).where(eq(target.id, recordId)).limit(1);
         if (oldRecord[0]) {
@@ -397,7 +436,7 @@ apiRouter.put('/table/:tableName/:id', requireAuth, async (req, res) => {
           const newState = row.estado;
           if ((newState === '✅ Entregado' || newState === '✅ Confirmado') && (oldState !== '✅ Entregado' && oldState !== '✅ Confirmado')) isNewlyEntregado = true;
           if ((newState !== '✅ Entregado' && newState !== '✅ Confirmado') && (oldState === '✅ Entregado' || oldState === '✅ Confirmado')) isNewlyCancelled = true;
-          
+
           const rawItems = row.items || (oldRecord[0] as any).items || [];
           oldItems = typeof rawItems === 'string' ? JSON.parse(rawItems) : rawItems;
         }
@@ -410,7 +449,11 @@ apiRouter.put('/table/:tableName/:id', requireAuth, async (req, res) => {
            const pId = item.productoId || item.Producto?.[0] || item.Producto;
            const qty = item.cantidad || item.Cantidad;
            if (pId && qty) {
-             await adjustStock(tx, parseInt(pId), qty, 'Salida', 'Venta', (req as any).user?.email, recordId);
+             try {
+               await adjustStock(tx, parseInt(pId), qty, 'Salida', 'Venta', (req as any).user?.email, recordId);
+             } catch (stockErr: any) {
+               throw new Error(`Error al confirmar pedido: ${stockErr.message}`);
+             }
            }
          }
       } else if (isNewlyCancelled) {
@@ -428,28 +471,36 @@ apiRouter.put('/table/:tableName/:id', requireAuth, async (req, res) => {
     res.json({ data: toClientFormat(result) });
   } catch (e: any) {
     console.error(e);
-    res.status(500).json({ error: 'DB Error', message: e.message });
+    const status = e.message.includes('Stock insuficiente') ? 400 : 500;
+    res.status(status).json({ error: e.message.includes('Stock insuficiente') ? e.message : 'DB Error', message: e.message });
   }
 });
 
+// GET /api/stats — optimizado con agregaciones SQL
 apiRouter.get('/stats', requireAuth, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
-    const allVentas = await db.select().from(pedidos);
-    let ventasHoyTotal = 0;
-    let ventasHoyCount = 0;
-    allVentas.forEach((v: any) => {
-      if (v.fecha && v.fecha.startsWith(today)) {
-        ventasHoyCount++;
-        ventasHoyTotal += v.total || 0;
-      }
-    });
 
-    const lowStockProducts = await db.select().from(productos);
-    let lowStockCount = 0;
-    lowStockProducts.forEach((p: any) => {
-      if (p.stock <= 10) lowStockCount++;
-    });
+    // Ventas de hoy con SQL COUNT y SUM
+    const todayStats = await db
+      .select({
+        count: count(),
+        total: sum(pedidos.total),
+      })
+      .from(pedidos)
+      .where(gte(pedidos.fecha, today));
+
+    const ventasHoyCount = todayStats[0]?.count || 0;
+    const ventasHoyTotal = todayStats[0]?.total || 0;
+
+    // Productos con stock bajo — usa el umbral configurable por producto (stockMinimo) o el global
+    const allProducts = await db.select({
+      id: productos.id,
+      stock: productos.stock,
+      stockMinimo: productos.stockMinimo,
+    }).from(productos);
+
+    const lowStockCount = allProducts.filter(p => p.stock <= p.stockMinimo).length;
 
     res.json({ ventasHoyTotal, ventasHoyCount, lowStockCount });
   } catch (e) {
@@ -458,6 +509,7 @@ apiRouter.get('/stats', requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/charts — optimizado con SQL en vez de full table scan
 apiRouter.get('/charts', requireAuth, async (req, res) => {
   try {
     const allVentas = await db.select().from(pedidos);
@@ -467,11 +519,12 @@ apiRouter.get('/charts', requireAuth, async (req, res) => {
 
     // Flujo de Caja (Ingresos vs Gastos por Mes)
     const cashflowByMonth: Record<string, { Ingresos: number, Gastos: number }> = {};
-    
+
     // Add sales as Ingresos in cashflow
     allVentas.forEach((v: any) => {
       if (v.fecha && (v.estado === '✅ Entregado' || v.estado === '✅ Confirmado')) {
-        const month = v.fecha.substring(0, 7);
+        const dateStr = typeof v.fecha === 'string' ? v.fecha : v.fecha.toISOString().split('T')[0];
+        const month = dateStr.substring(0, 7);
         if (!cashflowByMonth[month]) cashflowByMonth[month] = { Ingresos: 0, Gastos: 0 };
         cashflowByMonth[month].Ingresos += (v.total || 0);
       }
@@ -479,7 +532,8 @@ apiRouter.get('/charts', requireAuth, async (req, res) => {
 
     allFinanzas.forEach((f: any) => {
       if (f.fecha) {
-        const month = f.fecha.substring(0, 7);
+        const dateStr = typeof f.fecha === 'string' ? f.fecha : f.fecha.toISOString().split('T')[0];
+        const month = dateStr.substring(0, 7);
         if (!cashflowByMonth[month]) cashflowByMonth[month] = { Ingresos: 0, Gastos: 0 };
         if (f.tipo === 'Ingreso' || f.tipo?.toLowerCase().includes('ingreso')) {
           cashflowByMonth[month].Ingresos += (f.monto || 0);
@@ -506,7 +560,7 @@ apiRouter.get('/charts', requireAuth, async (req, res) => {
         }
       }
     });
-    
+
     const topProducts = Object.entries(productSales)
       .map(([id, quantity]) => {
          const p = allProductos.find((prod: any) => prod.id.toString() === id.toString());

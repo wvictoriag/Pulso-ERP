@@ -1,5 +1,5 @@
 import { relations } from 'drizzle-orm';
-import { integer, pgTable, serial, text, timestamp, boolean, jsonb } from 'drizzle-orm/pg-core';
+import { integer, pgTable, serial, text, timestamp, boolean, jsonb, date } from 'drizzle-orm/pg-core';
 
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
@@ -17,6 +17,7 @@ export const productos = pgTable('productos', {
   precio: integer('precio').notNull().default(0),
   costo: integer('costo').notNull().default(0),
   stock: integer('stock').notNull().default(0),
+  stockMinimo: integer('stock_minimo').notNull().default(10),
   esKit: boolean('es_kit').notNull().default(false),
   componentesKit: jsonb('componentes_kit').notNull().default('[]'),
   createdAt: timestamp('created_at').defaultNow(),
@@ -61,7 +62,7 @@ export const pedidos = pgTable('pedidos', {
   estado: text('estado').default('💬 Cotización'),
   canal: text('canal').default('Directo'),
   estadoPago: text('estado_pago').default('⏳ Pendiente'),
-  fecha: text('fecha').notNull(),
+  fecha: date('fecha').notNull(),
   items: jsonb('items').notNull().default('[]'),
   subtotal: integer('subtotal').notNull().default(0),
   iva: integer('iva').notNull().default(0),
@@ -75,7 +76,7 @@ export const kardex = pgTable('kardex', {
   tipoMovimiento: text('tipo_movimiento').notNull(), // Entrada, Salida
   motivo: text('motivo').notNull(), // Venta, Ajuste, Devolución, Merma
   cantidad: integer('cantidad').notNull(),
-  fecha: text('fecha').notNull(),
+  fecha: date('fecha').notNull(),
   usuario: text('usuario'),
   pedidoId: integer('pedido_id'),
   createdAt: timestamp('created_at').defaultNow(),
@@ -88,7 +89,7 @@ export const finanzas = pgTable('finanzas', {
   categoria: text('categoria').notNull(),
   metodoPago: text('metodo_pago').notNull(),
   monto: integer('monto').notNull(),
-  fecha: text('fecha').notNull(),
+  fecha: date('fecha').notNull(),
   proveedorId: integer('proveedor_id').references(() => proveedores.id),
   createdAt: timestamp('created_at').defaultNow(),
 });
