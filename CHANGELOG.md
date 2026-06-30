@@ -4,6 +4,24 @@ Todos los cambios notables en este proyecto serán documentados en este archivo.
 
 El formato se basa en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/).
 
+## [1.2.0] - 2026-07-01
+
+### Añadido
+- **SETUP.md**: Guía completa paso a paso para configurar Firebase, PostgreSQL y el primer usuario admin desde cero.
+- **Scripts npm de base de datos**: `db:push`, `db:generate`, `db:studio`, `db:seed` para operar la DB sin comandos largos.
+- **Soporte SSL en PostgreSQL**: Variables `SQL_SSL` en `.env`, `drizzle.config.ts` y `src/db/index.ts` soportan conexiones SSL (necesario para Supabase, Neon, etc.).
+- **Resolución inteligente de credenciales Firebase Admin**: `firebase-admin.ts` busca en 3 ubicaciones: `GOOGLE_APPLICATION_CREDENTIALS`, `FIREBASE_SERVICE_ACCOUNT_PATH`, y `firebase-service-account.json` local.
+
+### Corregido
+- **Firebase Admin hardcodeado**: Se eliminó el proyecto `gen-lang-client-0038484757` hardcodeado. Ahora siempre usa credenciales propias del usuario o lanza error claro con instrucciones.
+- **Config de Drizzle duplicada**: Se eliminó `src/db/drizzle.config.ts` conflictivo. Solo queda `drizzle.config.ts` en la raíz con variables consistentes.
+- **`.gitignore` incompleto**: Se añadió `firebase-service-account.json` para evitar subir credenciales al repositorio.
+
+### Cambiado
+- **Nombre del paquete**: Cambiado de `react-example` a `pulso-erp` en `package.json`.
+- **Versión**: Actualizada a `1.2.0`.
+- **`.env.example` ampliado**: Ahora incluye `SQL_SSL`, instrucciones para Supabase/Neon, y explicación de las dos opciones para credenciales de Firebase Admin.
+
 ## [1.1.0] - 2026-06-30
 
 ### Corregido (Bloqueantes Críticos)
